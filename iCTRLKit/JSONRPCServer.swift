@@ -373,6 +373,20 @@ class JSONRPCServer {
 
     // MARK: - Connection Handling
 
+    /// Largest request the server will buffer (headers + body). Requests are
+    /// small — the biggest legitimate one is a `type` envelope — while
+    /// responses (screenshots) are what gets large. Anything over this is
+    /// refused up front, so an unauthenticated peer cannot grow the process
+    /// until jetsam kills the runner by announcing a huge Content-Length.
+    static let maxRequestBytes = 1 << 20   // 1 MiB
+    /// Largest header block before the CRLFCRLF terminator must appear.
+    static let maxHeaderBytes = 32 * 1024
+    /// A connection that has not delivered a complete request by then is
+    /// dropped (slow-loris / half-open sockets would otherwise sit forever).
+    static let requestDeadline: TimeInterval = 30
+    /// Connections whose request has fully arrived (deadline no longer applies).
+    private var requestReceived: Set<ObjectIdentifier> = []
+
     private func handleConnection(_ connection: NWConnection) {
         connections.append(connection)
 
@@ -385,6 +399,14 @@ class JSONRPCServer {
             default:
                 break
             }
+        }
+
+        let id = ObjectIdentifier(connection)
+        queue.asyncAfter(deadline: .now() + Self.requestDeadline) { [weak self, weak connection] in
+            guard let self = self, let connection = connection,
+                  !self.requestReceived.contains(id), !self.handedOff.contains(id) else { return }
+            self.log("⏱️ Dropped \(connection.endpoint): no complete request within \(Int(Self.requestDeadline))s")
+            connection.cancel()
         }
 
         connection.start(queue: queue)
@@ -403,6 +425,10 @@ class JSONRPCServer {
             // rapid requests), and parsing a half-received body was the cause of
             // spurious "parse error" responses.
             switch Self.requestState(of: acc) {
+            case .tooLarge:
+                self.requestReceived.insert(ObjectIdentifier(connection))
+                self.log("🚫 Refused oversized request from \(connection.endpoint)")
+                self.sendHTTPResponse(connection: connection, status: 413, body: "Payload Too Large")
             case .incomplete:
                 if isComplete || error != nil {
                     connection.cancel()  // peer closed before sending it all
@@ -410,6 +436,7 @@ class JSONRPCServer {
                     self.receiveHTTP(from: connection, buffer: acc)  // wait for more
                 }
             case .complete(let headerEnd, let contentLength):
+                self.requestReceived.insert(ObjectIdentifier(connection))
                 self.processHTTPRequest(acc, headerEnd: headerEnd, contentLength: contentLength, from: connection)
                 // A streaming route (e.g. /stream) takes ownership of the socket
                 // and keeps it open — don't cancel it here.
@@ -424,15 +451,21 @@ class JSONRPCServer {
     private enum RequestState {
         case incomplete
         case complete(headerEnd: Int, contentLength: Int)
+        /// Headers or body exceed the caps; refuse without reading further.
+        case tooLarge
     }
 
     /// Determine whether `acc` holds a complete HTTP request. Operates on raw
-    /// bytes (binary-safe) and honors Content-Length.
+    /// bytes (binary-safe) and honors Content-Length, within `maxHeaderBytes`
+    /// and `maxRequestBytes`.
     private static func requestState(of acc: Data) -> RequestState {
         // Find the CRLFCRLF header/body separator.
         let sep = Data([0x0D, 0x0A, 0x0D, 0x0A])
-        guard let r = acc.range(of: sep) else { return .incomplete }
+        guard let r = acc.range(of: sep) else {
+            return acc.count > maxHeaderBytes ? .tooLarge : .incomplete
+        }
         let headerEnd = r.upperBound
+        if headerEnd - acc.startIndex > maxHeaderBytes { return .tooLarge }
         // Parse Content-Length from the header block (case-insensitive).
         let headerData = acc.subdata(in: acc.startIndex..<r.lowerBound)
         let headerStr = String(data: headerData, encoding: .utf8) ?? ""
@@ -444,6 +477,9 @@ class JSONRPCServer {
                 break
             }
         }
+        // A negative length is nonsense; a huge one is refused before any of
+        // it is buffered.
+        if contentLength < 0 || headerEnd + contentLength > maxRequestBytes { return .tooLarge }
         let haveBody = acc.count - headerEnd
         return haveBody >= contentLength ? .complete(headerEnd: headerEnd, contentLength: contentLength)
                                          : .incomplete
@@ -592,11 +628,17 @@ class JSONRPCServer {
             handleLogs(connection: connection)
 
         case ("POST", "/pair"):
-            handlePair(body: body, connection: connection, isLoopback: isLoopback(connection),
-                       nearby: isNearby(connection))
+            handlePair(body: body, headers: headers, connection: connection,
+                       isLoopback: isLoopback(connection), nearby: isNearby(connection))
 
         case ("POST", "/rpc"):
             handleRPC(headers: headers, body: body, connection: connection)
+
+        // No CORS preflight success for /pair: a cross-site page must never
+        // be able to start a pairing (see `handlePair`).
+        case ("OPTIONS", "/pair"):
+            sendHTTPResponse(connection: connection, status: 403,
+                             body: "Cross-origin pairing is not allowed", cors: false)
 
         case ("OPTIONS", _):
             sendHTTPResponse(connection: connection, status: 200, headers: corsHeaders(), body: "")
@@ -803,7 +845,23 @@ class JSONRPCServer {
     ///     an ephemeral device key, so it is safe over the LAN.
     ///
     /// Blocks until the user taps Allow (or the alert times out).
-    private func handlePair(body: Data?, connection: NWConnection, isLoopback: Bool, nearby: Bool) {
+    ///
+    /// Browsers: a request that carries an `Origin` header is accepted only
+    /// when that origin IS this server (the bundled `/remote` page pairing
+    /// from the same origin), and never for a plain grant. Without this, any
+    /// web page open in Safari on the phone could POST to 127.0.0.1:8200 as a
+    /// loopback caller, put a pairing prompt on screen under a name of its
+    /// choosing, and — with CORS — read the key straight out of the reply.
+    /// Responses here carry no CORS headers for the same reason.
+    private func handlePair(body: Data?, headers: [String: String], connection: NWConnection,
+                            isLoopback: Bool, nearby: Bool) {
+        let fromBrowser = headers["origin"] != nil
+        if fromBrowser, !Self.isSameOrigin(origin: headers["origin"], host: headers["host"]) {
+            log("🚫 Refused /pair from cross-site origin \(headers["origin"] ?? "")")
+            sendPairError(connection, status: 403, code: "cross_origin_forbidden",
+                          message: "Pairing cannot be started by a web page from another origin")
+            return
+        }
         guard let body = body,
               let obj = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
               let clientName = obj["client_name"] as? String, !clientName.isEmpty else {
@@ -826,6 +884,14 @@ class JSONRPCServer {
         if isPlain && !isLoopback {
             sendPairError(connection, status: 403, code: "plain_forbidden",
                           message: "Plain grant is localhost/USB only; use X25519 mode")
+            return
+        }
+        if isPlain && fromBrowser {
+            // A page on the phone reaches 127.0.0.1 and would pass the loopback
+            // check above; the key would then be readable by its script. The
+            // bundled /remote page pairs with X25519, so no browser needs this.
+            sendPairError(connection, status: 403, code: "plain_forbidden",
+                          message: "Plain grant is not available to browsers; use X25519 mode")
             return
         }
 
@@ -895,9 +961,19 @@ class JSONRPCServer {
             if let data = try? JSONSerialization.data(withJSONObject: response, options: .prettyPrinted),
                let json = String(data: data, encoding: .utf8) {
                 self.sendHTTPResponse(connection: connection, status: 200,
-                                      contentType: "application/json", body: json)
+                                      contentType: "application/json", body: json, cors: false)
             }
         }
+    }
+
+    /// Whether a browser `Origin` names this very server. `host` is the
+    /// request's `Host` header; browsers set both, and a page served by this
+    /// server sends `http://<host>` as its origin. Scheme is http: the server
+    /// never speaks TLS, so an https origin can only be someone else's page.
+    static func isSameOrigin(origin: String?, host: String?) -> Bool {
+        guard let origin = origin?.lowercased(), let host = host?.lowercased(),
+              !host.isEmpty else { return false }
+        return origin == "http://" + host
     }
 
     private func sendPairError(_ connection: NWConnection, status: Int, code: String, message: String,
@@ -912,7 +988,7 @@ class JSONRPCServer {
         let data = (try? JSONSerialization.data(withJSONObject: ["error": error])) ?? Data("{}".utf8)
         sendHTTPResponse(connection: connection, status: status, headers: headers,
                          contentType: "application/json",
-                         body: String(data: data, encoding: .utf8) ?? "{}")
+                         body: String(data: data, encoding: .utf8) ?? "{}", cors: false)
     }
 
     /// GET /stream[.ts]?ticket=… — live H.264-in-MPEG-TS screen video.
@@ -1203,27 +1279,31 @@ class JSONRPCServer {
         for (k, v) in headers { allHeaders[k] = v }
 
         let headerString = allHeaders.map { "\($0.key): \($0.value)" }.joined(separator: "\r\n")
-        var responseData = "HTTP/1.1 \(status) OK\r\n\(headerString)\r\n\r\n".data(using: .utf8) ?? Data()
+        var responseData = "HTTP/1.1 \(status) \(Self.statusText(status))\r\n\(headerString)\r\n\r\n".data(using: .utf8) ?? Data()
         responseData.append(body)
         connection.send(content: responseData, completion: .contentProcessed { _ in
             connection.cancel()
         })
     }
 
+    private static func statusText(_ status: Int) -> String {
+        switch status {
+        case 200: return "OK"
+        case 400: return "Bad Request"
+        case 401: return "Unauthorized"
+        case 403: return "Forbidden"
+        case 404: return "Not Found"
+        case 413: return "Payload Too Large"
+        case 429: return "Too Many Requests"
+        case 500: return "Internal Server Error"
+        case 503: return "Service Unavailable"
+        default: return "Unknown"
+        }
+    }
+
     private func sendHTTPResponse(connection: NWConnection, status: Int, headers: [String: String] = [:],
                                   contentType: String = "text/plain", body: String, cors: Bool = true) {
-        let statusText: String
-        switch status {
-        case 200: statusText = "OK"
-        case 400: statusText = "Bad Request"
-        case 401: statusText = "Unauthorized"
-        case 403: statusText = "Forbidden"
-        case 404: statusText = "Not Found"
-        case 429: statusText = "Too Many Requests"
-        case 500: statusText = "Internal Server Error"
-        default: statusText = "Unknown"
-        }
-
+        let statusText = Self.statusText(status)
         let bodyData = body.data(using: .utf8) ?? Data()
 
         var allHeaders = corsHeaders()
@@ -1253,6 +1333,8 @@ class JSONRPCServer {
     private func removeConnection(_ connection: NWConnection) {
         connections.removeAll { $0 === connection }
         nearbyConnections.remove(ObjectIdentifier(connection))
+        requestReceived.remove(ObjectIdentifier(connection))
+        handedOff.remove(ObjectIdentifier(connection))
     }
 
     deinit {

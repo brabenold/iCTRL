@@ -619,6 +619,13 @@ Pairing rules:
   from the phone itself (the iCTRL app, USB) have their own slot, so a remote
   caller can't lock them out.
 - Requests that arrive over AWDL are labelled *nearby device* in the prompt.
+- **A web page cannot start a pairing** unless it is the runner's own
+  `/remote` page: `/pair` refuses a cross-site `Origin`, answers without
+  CORS headers, and never hands a browser a plain-text key. Otherwise any
+  page open in Safari on the phone could reach `127.0.0.1:8200`, put a
+  prompt on screen under a name of its choosing and read the key.
+- Requests are capped at 1 MiB and must arrive within 30 s, so an
+  unauthenticated peer on the LAN cannot exhaust the runner's memory.
 - `config` lists each client with where it last connected from (this device /
   USB, LAN, nearby, VPN) and can revoke it, as can the iCTRL app.
 
