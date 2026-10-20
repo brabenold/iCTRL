@@ -46,6 +46,27 @@ int buf_appendf(buf *b, const char *fmt, ...) {
     return rc;
 }
 
+/// Append `s` as the contents of a JSON string (no surrounding quotes):
+/// `"` and `\` are escaped, control characters become \u00XX. Used wherever
+/// caller-supplied text (a client name from argv) is placed inside JSON, so a
+/// quote in it cannot break the document.
+int buf_append_json(buf *b, const char *s) {
+    static const char HX[] = "0123456789abcdef";
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') {
+            char esc[2] = { '\\', (char)c };
+            if (buf_append(b, esc, 2) != 0) return -1;
+        } else if (c < 0x20) {
+            char esc[6] = { '\\', 'u', '0', '0', HX[c >> 4], HX[c & 15] };
+            if (buf_append(b, esc, 6) != 0) return -1;
+        } else if (buf_append(b, s, 1) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static const char HEX[] = "0123456789abcdef";
 
 void hex_encode(const uint8_t *in, size_t n, char *out) {

@@ -455,10 +455,12 @@ static void save_token(const char *host, const uint8_t key[32], const char *tok,
     char keyhex[65];
     hex_encode(key, 32, keyhex);
     if (wrote) buf_append(&out, ",\n", 2);
-    buf_appendf(&out,
-                "  \"%s\": {\n    \"tok\": \"%s\",\n    \"key\": \"%s\",\n"
-                "    \"client_name\": \"%s\"\n  }",
-                host, tok, keyhex, client_name);
+    buf_append(&out, "  \"", 3);
+    buf_append_json(&out, host);
+    buf_appendf(&out, "\": {\n    \"tok\": \"%s\",\n    \"key\": \"%s\",\n"
+                      "    \"client_name\": \"", tok, keyhex);
+    buf_append_json(&out, client_name);
+    buf_append(&out, "\"\n  }", 5);
     buf_append(&out, "\n}\n", 3);
 
     // 0600 from the start — this file is the device's session key.
@@ -639,7 +641,9 @@ static int do_pair(const char *hostport, const char *client_name) {
 
     buf req;
     buf_init(&req);
-    buf_appendf(&req, "{\"client_name\":\"%s\",\"pub\":\"%s\"}", client_name, pub_b64);
+    buf_append(&req, "{\"client_name\":\"", 16);
+    buf_append_json(&req, client_name);
+    buf_appendf(&req, "\",\"pub\":\"%s\"}", pub_b64);
 
     buf resp;
     int status = 0;

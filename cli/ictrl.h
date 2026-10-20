@@ -48,6 +48,7 @@ void buf_init(buf *b);
 void buf_free(buf *b);
 int buf_append(buf *b, const void *data, size_t n);
 int buf_appendf(buf *b, const char *fmt, ...);
+int buf_append_json(buf *b, const char *s);
 
 // ── Encoding ────────────────────────────────────────────────────────────────
 
